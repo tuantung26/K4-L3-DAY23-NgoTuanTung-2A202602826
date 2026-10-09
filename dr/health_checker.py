@@ -13,10 +13,6 @@ Yêu cầu (đọc §4 "Kiến Trúc Health-Check-Based Failover" + §2 "DNS Fai
 
 Chạy:  python dr/health_checker.py --interval 5 --threshold 3 --duration 300 \
               --out reports/health-events.jsonl
-
-CÂU HỎI PHẢI TRẢ LỜI TRƯỚC KHI VIẾT (ghi câu trả lời vào reports/postmortem.md):
-  interval=5s, threshold=3 -> sớm nhất bạn có thể phát hiện outage là bao nhiêu giây?
-  Con số đó nằm TRONG RTO của bạn. Muốn RTO 5 phút thì được phép chọn interval bao nhiêu?
 """
 import argparse
 import json
@@ -29,13 +25,81 @@ URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
 def probe(region: str, timeout: float) -> tuple[bool, str]:
-    """TODO: trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
-    raise NotImplementedError
+    """Trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            r = client.get(f"{URL[region]}/readyz")
+            if r.status_code == 200:
+                return True, "ok"
+            try:
+                data = r.json()
+                reasons = data.get("reasons", [f"status_{r.status_code}"])
+                return False, ",".join(reasons)
+            except Exception:
+                return False, f"status_{r.status_code}"
+    except httpx.TimeoutException:
+        return False, "timeout"
+    except httpx.ConnectError:
+        return False, "connect_error"
+    except Exception as e:
+        return False, str(type(e).__name__)
 
 
 def run(interval: float, timeout: float, threshold: int, duration: float, out: pathlib.Path):
-    """TODO: vòng lặp poll + phát hiện transition + ghi JSONL."""
-    raise NotImplementedError
+    """Vòng lặp poll + phát hiện transition + ghi JSONL."""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        "a": {"status": "HEALTHY", "consecutive_fails": 0, "consecutive_success": 0},
+        "b": {"status": "HEALTHY", "consecutive_fails": 0, "consecutive_success": 0},
+    }
+    end_time = time.time() + duration
+    with out.open("a", encoding="utf-8") as f:
+        while time.time() < end_time:
+            loop_start = time.time()
+            for r in ("a", "b"):
+                ok, reason = probe(r, timeout)
+                st = state[r]
+                if ok:
+                    st["consecutive_success"] += 1
+                    st["consecutive_fails"] = 0
+                    if st["status"] != "HEALTHY" and st["consecutive_success"] >= threshold:
+                        st["status"] = "HEALTHY"
+                        rec = {
+                            "event": "state_change",
+                            "ts": time.time(),
+                            "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "region": r,
+                            "to": "HEALTHY",
+                            "reason": reason,
+                            "interval_s": interval,
+                            "threshold": threshold,
+                            "consecutive_success": st["consecutive_success"],
+                        }
+                        f.write(json.dumps(rec) + "\n")
+                        f.flush()
+                        print("HEALTH", json.dumps(rec))
+                else:
+                    st["consecutive_fails"] += 1
+                    st["consecutive_success"] = 0
+                    if st["status"] != "UNHEALTHY" and st["consecutive_fails"] >= threshold:
+                        st["status"] = "UNHEALTHY"
+                        rec = {
+                            "event": "state_change",
+                            "ts": time.time(),
+                            "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "region": r,
+                            "to": "UNHEALTHY",
+                            "reason": reason,
+                            "interval_s": interval,
+                            "threshold": threshold,
+                            "consecutive_fails": st["consecutive_fails"],
+                        }
+                        f.write(json.dumps(rec) + "\n")
+                        f.flush()
+                        print("HEALTH", json.dumps(rec))
+            elapsed = time.time() - loop_start
+            sleep_time = max(0.0, interval - elapsed)
+            time.sleep(sleep_time)
 
 
 if __name__ == "__main__":
